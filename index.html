@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Pose + MIDI Center Burst + Shoulder Ball Control</title>
+
+<style>
+  html,body{ margin:0; height:100%; overflow:hidden; background:#000; }
+  #stage{ position:fixed; inset:0; background:#000; }
+  video,canvas{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+
+  #ui{
+    position:fixed; left:12px; top:12px; z-index:10;
+    display:flex; gap:10px; align-items:center;
+    padding:10px 12px; border-radius:14px;
+    background:rgba(0,0,0,.38);
+    border:1px solid rgba(255,255,255,.18);
+    color:#fff; font-family:system-ui,"Noto Sans TC",sans-serif;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    user-select:none;
+  }
+  button,input{
+    background:rgba(255,255,255,.10);
+    border:1px solid rgba(255,255,255,.20);
+    color:#fff;
+    padding:8px 10px;
+    border-radius:12px;
+    font-weight:700;
+  }
+  button{ cursor:pointer; }
+  button:disabled{ opacity:.45; cursor:not-allowed; }
+  #status{
+    font-size:13px;
+    opacity:.9;
+    max-width:min(56vw,520px);
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+</style>
+</head>
+
+<body>
+  <div id="stage">
+    <video id="video" muted playsinline></video>
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <div id="ui">
+    <input type="file" id="midiFile" accept=".mid,.midi">
+    <button id="btnStart">Start</button>
+    <button id="btnStop" disabled>Stop</button>
+    <span id="status">請先選 MIDI 檔</span>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/build/Midi.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tone@14.8.49/build/Tone.js"></script>
+
+  <script type="module">
+    const MP_VER = "0.10.32";
+    import {
+      FilesetResolver,
+      PoseLandmarker,
+      DrawingUtils
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.32/vision_bundle.mjs";
+
+    // ======================
+    // DOM
+    // ======================
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    const midiInput = document.getElementById("midiFile");
+    const btnStart = document.getElementById("btnStart");
+    const btnStop  = document.getElementById("btnStop");
+    const statusEl = document.getElementById("status");
+
+    function setStatus(text){ statusEl.textContent = text; }
+
+    function resizeCanvasToVideo(){
+      const w = video.videoWidth || 1280;
+      const h = video.videoHeight || 720;
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+    }
+
+    // ======================
+    // MediaPipe Pose
+    // ======================
+    const WASM_ROOT = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`;
+    const MODEL_URL =
+      "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task";
+
+    let stream = null;
+    let poseLandmarker = null;
+    let drawUtil = null;
+
+    async function startCamera(){
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width:{ideal:1280}, height:{ideal:720} },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+    }
+
+    async function initPose(){
+      setStatus("載入 Pose 模型中…");
+      const vision = await FilesetResolver.forVisionTasks(WASM_ROOT);
+
+      const opts = (delegate) => ({
+        baseOptions: { modelAssetPath: MODEL_URL, delegate },
+        runningMode: "VIDEO",
+        numPoses: 1
+      });
+
+      try{
+        poseLandmarker = await PoseLandmarker.createFromOptions(vision, opts("GPU"));
+      }catch(err){
+        console.warn("GPU delegate failed, fallback to CPU:", err);
+        poseLandmarker = await PoseLandmarker.createFromOptions(vision, opts("CPU"));
+      }
+
+      drawUtil = new DrawingUtils(ctx);
+      setStatus(midiLoaded ? "模型就緒 ✅（可 Start）" : "模型就緒 ✅（請先選 MIDI）");
+    }
+
+    // ======================
+    // ✅ 36 lanes + Center Burst (no lane lines)
+    // ======================
+    const KEY_COUNT = 36;
+
+    // 音符從畫面中央飛出來（消失點）
+    const VPX_RATIO = 0.50;
+    const VPY_RATIO = 0.50;
+
+    // C4-B4 放在螢幕中間 12 lanes
+    function midiToKey36(midi){
+      const octave = Math.floor(midi / 12) - 1;
+      const note = ((midi % 12) + 12) % 12;
+
+      if (octave === 4) return 12 + note;  // 中間
+      if (octave >= 5) return 0 + note;    // 左：高音
+      return 24 + note;                    // 右：低音
+    }
+
+    // 固定亂數（穩定分散）
+    function hash01(u){
+      const x = Math.sin(u * 12.9898) * 43758.5453;
+      return x - Math.floor(x);
+    }
+
+    // ======================
+    // MIDI notes
+    // ======================
+    let midiNotes = [];
+    let midiLoaded = false;
+
+    // ======================
+    // Animation control
+    // ======================
+    let running = false;
+    let rafId = null;
+    let startPerfMs = 0;
+
+    // ======================
+    // Audio (Tone.js)
+    // ======================
+    let synth = null;
+    let part = null;
+
+    function disposeAudioPart(){
+      try{
+        if(part){
+          part.stop();
+          part.dispose();
+          part = null;
+        }
+      }catch(_){}
+    }
+    function resetAudio(){
+      disposeAudioPart();
+    }
+
+    async function initAudio(){
+      await Tone.start();
+
+      Tone.Transport.stop();
+      Tone.Transport.cancel();
+      Tone.Transport.position = 0;
+
+      if(!synth){
+        synth = new Tone.PolySynth(Tone.Synth, {
+          oscillator: { type: "triangle" }
+        }).toDestination();
+      }
+
+      disposeAudioPart();
+
+      const events = midiNotes.map(n => ({
+        time: n.timeSec,
+        midi: n.midi,
+        dur: n.durationSec
+      }));
+
+      part = new Tone.Part((time, value) => {
+        const freq = Tone.Frequency(value.midi, "midi");
+        synth.triggerAttackRelease(freq, value.dur, time, 0.9);
+      }, events);
+
+      part.start(0);
+      Tone.Transport.loop = false;
+    }
+
+    function startAudio(){
+      Tone.Transport.stop();
+      Tone.Transport.position = 0;
+      Tone.Transport.start("+0.02");
+    }
+
+    function stopAudio(){
+      try{
+        Tone.Transport.stop();
+        Tone.Transport.cancel();
+        Tone.Transport.position = 0;
+      }catch(_){}
+      disposeAudioPart();
+    }
+
+    // ======================
+    // MIDI Load
+    // ======================
+    midiInput.addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      if(!file){
+        midiLoaded = false;
+        midiNotes = [];
+        resetAudio();
+        setStatus("未選擇 MIDI");
+        return;
+      }
+
+      setStatus("讀取 MIDI 中…");
+      const buffer = await file.arrayBuffer();
+      const midi = new Midi(buffer);
+
+      const notes = [];
+      for (const track of midi.tracks){
+        for (const n of track.notes){
+          const octave = Math.floor(n.midi / 12) - 1;
+          const band = (octave >= 5) ? -1 : (octave === 4 ? 0 : 1); // -1上/0中/1下
+
+          notes.push({
+            midi: n.midi,
+            timeSec: n.time,
+            durationSec: n.duration,
+            key: midiToKey36(n.midi),
+            band,
+            seed: (n.midi * 131 + Math.floor(n.time * 1000) * 17) >>> 0
+          });
+        }
+      }
+
+      notes.sort((a,b)=>a.timeSec - b.timeSec);
+
+      midiNotes = notes;
+      midiLoaded = notes.length > 0;
+
+      resetAudio();
+      setStatus(midiLoaded ? `MIDI 已載入 ✅（音符數：${notes.length}）` : "MIDI 沒有音符或格式不支援");
+    });
+
+    // ======================
+    // Notes render
+    // ======================
+    function clamp01(v){ return Math.max(0, Math.min(1, v)); }
+    function easeOutCubic(t){ return 1 - Math.pow(1 - t, 3); }
+
+    function drawBackToFrontNotes(nowMs){
+      const laneW = canvas.width / KEY_COUNT;
+      const tSec = (nowMs - startPerfMs) / 1000;
+
+      const APPROACH_WINDOW = 2.2;
+      const AFTER_LIFE = 0.15;
+
+      const MIN_R = 4;
+      const MAX_R = 54;
+      const MIN_A = 0.06;
+      const MAX_A = 0.68;
+
+      const VPX = canvas.width  * VPX_RATIO;
+      const VPY = canvas.height * VPY_RATIO;
+
+      ctx.save();
+      ctx.lineWidth = 2;
+
+      for (const n of midiNotes){
+        const dt = n.timeSec - tSec;
+        if (dt > APPROACH_WINDOW) continue;
+        if (dt < -AFTER_LIFE) continue;
+
+        const p = easeOutCubic(clamp01(1 - (dt / APPROACH_WINDOW)));
+
+        const r = MIN_R + (MAX_R - MIN_R) * p;
+        const a = MIN_A + (MAX_A - MIN_A) * p;
+
+        const targetX = (n.key + 0.5) * laneW;
+
+        // 上/中/下高度分散（你可微調）
+        const yTop = canvas.height * 0.28;
+        const yMid = canvas.height * 0.48;
+        const yBot = canvas.height * 0.74;
+
+        const baseY = (n.band === -1) ? yTop : (n.band === 0 ? yMid : yBot);
+        const jitter = (hash01(n.seed) - 0.5) * canvas.height * 0.12;
+        const targetY = baseY + jitter;
+
+        const persp = 1 - p;
+        const x2 = VPX * persp + targetX * (1 - persp);
+        const y2 = VPY * persp + targetY * (1 - persp);
+
+        ctx.shadowBlur = 30 * p;
+        ctx.shadowColor = `rgba(255,255,255,${0.45 * p})`;
+
+        ctx.fillStyle   = `rgba(200,200,200,${a})`;
+        ctx.strokeStyle = `rgba(255,255,255,${0.10 + 0.22*p})`;
+
+        ctx.beginPath();
+        ctx.arc(x2, y2, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+
+      ctx.restore();
+    }
+
+    // ======================
+    // ✅ Shoulder Ball Control
+    // 規則：
+    // - 左右：肩膀中心 X 跟著人左右移動
+    // - 上下：必須「雙手」一起控制
+    //   - 兩手腕都高於肩膀 => 球往上
+    //   - 兩手腕都低於肩膀 => 球往下
+    //   - 其它 => 球維持高度
+    // ======================
+    const BALL = {
+      x: 0.5,      // normalized 0..1
+      y: 0.52,     // normalized 0..1
+      yTarget: 0.52,
+      r: 44,
+      smoothX: 0.18,  // 越大越跟手，越小越穩
+      smoothY: 0.12
+    };
+
+    // y 的三段位置（上/中/下）
+    const BALL_Y_TOP = 0.28;
+    const BALL_Y_MID = 0.52;
+    const BALL_Y_BOT = 0.78;
+
+    // 手腕相對肩膀的判定容忍（避免剛好貼齊時閃爍）
+    const HAND_MARGIN = 0.03; // 以 normalized y 計算
+
+    function drawControlBall(){
+      const x = BALL.x * canvas.width;
+      const y = BALL.y * canvas.height;
+
+      ctx.save();
+      ctx.shadowBlur = 26;
+      ctx.shadowColor = "rgba(255,255,255,0.35)";
+
+      ctx.fillStyle = "rgba(180,180,180,0.55)";
+      ctx.strokeStyle = "rgba(255,255,255,0.25)";
+      ctx.lineWidth = 2;
+
+      ctx.beginPath();
+      ctx.arc(x, y, BALL.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    function updateBallFromPose(lm){
+      // MediaPipe Pose landmark index:
+      // 11 = left shoulder, 12 = right shoulder
+      // 15 = left wrist, 16 = right wrist
+      const ls = lm[11], rs = lm[12], lw = lm[15], rw = lm[16];
+      if(!ls || !rs || !lw || !rw) return;
+
+      // 基本可信度（可用 visibility，lite 模型有時會缺；有就用）
+      const visOk = (p) => (p.visibility == null) ? true : (p.visibility > 0.45);
+      if(!visOk(ls) || !visOk(rs)) return;
+
+      // 肩膀中心
+      const cx = (ls.x + rs.x) * 0.5;
+      const cy = (ls.y + rs.y) * 0.5;
+
+      // ✅ 左右：直接跟著肩膀中心 x（並做平滑）
+      BALL.x = BALL.x + (cx - BALL.x) * BALL.smoothX;
+
+      // ✅ 上下：用「雙手」判定，否則維持目前 yTarget
+      // 兩手都高於肩膀 => 往上；兩手都低於肩膀 => 往下
+      const handsUp =
+        visOk(lw) && visOk(rw) &&
+        (lw.y < cy - HAND_MARGIN) &&
+        (rw.y < cy - HAND_MARGIN);
+
+      const handsDown =
+        visOk(lw) && visOk(rw) &&
+        (lw.y > cy + HAND_MARGIN) &&
+        (rw.y > cy + HAND_MARGIN);
+
+      if(handsUp){
+        BALL.yTarget = BALL_Y_TOP;
+      }else if(handsDown){
+        BALL.yTarget = BALL_Y_BOT;
+      }else{
+        // 其它情況：維持（不要亂動）
+        // 如果你希望「回中間」，把這行改成 BALL_Y_MID
+        // BALL.yTarget = BALL.yTarget;
+      }
+
+      // 平滑移動到 yTarget
+      BALL.y = BALL.y + (BALL.yTarget - BALL.y) * BALL.smoothY;
+    }
+
+    // ======================
+    // Render loop
+    // ======================
+    function loop(){
+      if(!running) return;
+
+      const now = performance.now();
+      resizeCanvasToVideo();
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      const result = poseLandmarker.detectForVideo(video, now);
+      if(result?.landmarks?.length){
+        for (const lm of result.landmarks){
+          // 畫骨架（你若想更乾淨，可以註解掉這兩行）
+          drawUtil.drawLandmarks(lm, { radius: 3 });
+          drawUtil.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS);
+
+          // ✅ 更新球位置（肩膀 + 雙手控制）
+          updateBallFromPose(lm);
+        }
+      }
+
+      // MIDI notes
+      drawBackToFrontNotes(now);
+
+      // ✅ 控制球畫在最上層
+      drawControlBall();
+
+      rafId = requestAnimationFrame(loop);
+    }
+
+    // ======================
+    // Start / Stop
+    // ======================
+    async function startAll(){
+      if(running) return;
+      if(!midiLoaded){
+        setStatus("請先選 MIDI 檔再 Start");
+        return;
+      }
+
+      btnStart.disabled = true;
+      setStatus("啟動相機/模型/音訊中…");
+
+      if(!stream) await startCamera();
+      if(!poseLandmarker) await initPose();
+
+      await initAudio();
+
+      startPerfMs = performance.now();
+      startAudio();
+
+      running = true;
+      btnStop.disabled = false;
+      setStatus("運行中 ✅");
+
+      loop();
+    }
+
+    function stopAll(){
+      running = false;
+      if(rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+
+      stopAudio();
+
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      setStatus("已停止");
+    }
+
+    btnStart.addEventListener("click", () => {
+      startAll().catch(err => {
+        console.error(err);
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+        setStatus("啟動失敗：" + (err?.message ?? err));
+      });
+    });
+
+    btnStop.addEventListener("click", stopAll);
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && running) stopAll();
+    });
+
+    // 先啟動相機+模型（不自動播音訊）
+    (async () => {
+      try{
+        setStatus("初始化相機/模型（不播放聲音）…");
+        await startCamera();
+        await initPose();
+        setStatus(midiLoaded ? "就緒 ✅（可 Start）" : "就緒 ✅（請先選 MIDI）");
+      }catch(err){
+        console.error(err);
+        setStatus("初始化失敗（請允許相機權限）：" + (err?.message ?? err));
+      }
+    })();
+  </script>
+</body>
+</html>
